@@ -1,0 +1,183 @@
+{-
+
+    Example of using model-checking to find an error in a TinyOS module.
+    
+    Allan McInnes / ECE Canterbury / 2010-03-09
+ -}
+
+include "lib_tinyos_2.csp"
+
+nametype NesC_Function = 
+    Union({MainC_IF, TimerTestC_IF, TimerC_IF, AlarmC_IF, AlarmToTimerC_IF})
+
+datatype Task = AlarmToTimerC_fired | TimerC_fired | TimerTestC_stop
+
+datatype IntHandler = AlarmHW_fire
+
+nametype HwActions = {}
+
+MAX_TICKS = 10
+datatype NesC_Variable = 
+    tickCount.{0..MAX_TICKS}
+    | running.Bool
+
+-- Simple alarm interface (based loosely on tos/lib/timer/Alarm.nc
+datatype AlarmIF = Alarm_start
+                 | Alarm_stop
+                 | Alarm_fired
+                 
+-- Alarm component provides Alarm interface
+datatype AlarmC_IF = AlarmC.AlarmIF
+
+-- AlarmToTimer component uses Alarm and provides Timer
+datatype AlarmToTimerC_IF = AlarmToTimerC.Union({AlarmIF, TimerIF})
+
+-- Timer component provides Timer
+datatype TimerC_IF = TimerC.TimerIF
+ 
+--{-
+-- Good model
+Module_AlarmToTimerC = 
+  let   
+    StateEvents = VarEvents({running})
+    StateVars = Var(running, false)
+    
+    StartStop = 
+        (command(AlarmToTimerC.Timer_startPeriodic, 
+                call(AlarmToTimerC.Alarm_start);
+                assign(running, true)); 
+                StartStop)   
+        []
+        (command(AlarmToTimerC.Timer_stop, 
+                call(AlarmToTimerC.Alarm_stop);
+                assign(running, false)); 
+                StartStop) 
+                
+    FiredTask = 
+        (task(AlarmToTimerC_fired,
+                read(running, \ run @
+                (if run
+                then call(AlarmToTimerC.Alarm_start)
+                else SKIP);
+                signal(AlarmToTimerC.Timer_fired)));
+            FiredTask)                 
+            
+    AlarmFired = 
+            async_event(AlarmToTimerC.Alarm_fired,    
+                \ context @
+                    async_post(context)(AlarmToTimerC_fired)); 
+            AlarmFired
+  within
+    (StartStop ||| FiredTask ||| AlarmFired) [| StateEvents |] StateVars
+--}
+-- Buggy model
+{-
+Module_AlarmToTimerC = 
+  let   
+    StartStop = 
+        (command(AlarmToTimerC.Timer_startPeriodic, 
+                call(AlarmToTimerC.Alarm_start)); 
+                StartStop)   
+        []
+        (command(AlarmToTimerC.Timer_stop, 
+                call(AlarmToTimerC.Alarm_stop)); 
+                StartStop) 
+                
+    FiredTask = 
+        (task(AlarmToTimerC_fired,
+                call(AlarmToTimerC.Alarm_start);
+                signal(AlarmToTimerC.Timer_fired));
+            FiredTask)                 
+            
+    AlarmFired = 
+            async_event(AlarmToTimerC.Alarm_fired,    
+                \ context @
+                    async_post(context)(AlarmToTimerC_fired)); 
+            AlarmFired
+  within
+    (StartStop ||| FiredTask ||| AlarmFired)
+-}
+
+-- Simple model of a hardware alarm that provides an async interrupt.
+-- Note that the alarm can be stopped at any time. In practice the details
+-- of this process are platform-dependent.
+skip() = \ _ @ SKIP
+Module_AlarmC = 
+  let
+    Idle = 
+        (async_command(AlarmC.Alarm_start, skip()); Running)
+        []
+        (async_command(AlarmC.Alarm_stop, skip()); Idle)
+    Running = 
+        (TOSH_SIGNAL(AlarmHW_fire,
+            \ context @
+                async_signal(context)(AlarmC.Alarm_fired)); Idle)
+        []
+        (async_command(AlarmC.Alarm_stop, skip()); Idle)  
+  within
+    Idle
+    
+-- We construct a Timer component using the Alarm and AlarmToTimer components.
+-- This is a somewhat simplified version of what you might find in
+-- something like tos/platforms/mica/HilTimerMilliC.nc
+{-
+Configuration_TimerC = 
+    (wiring(Module_AlarmToTimerC, Module_AlarmC,
+           {(AlarmToTimerC, AlarmC, AlarmIF)}))
+    [[ exec.e.AlarmToTimerC.f <- exec.e.TimerC.f | e <- Exec, f <- TimerIF ]]
+-}
+Configuration_TimerC = 
+    passthru(wiring(Module_AlarmToTimerC, Module_AlarmC,
+                {(AlarmToTimerC, AlarmC, AlarmIF)}),
+                AlarmToTimerC, TimerC, {TimerIF})
+    
+-- A tester component
+datatype TimerTestC_IF = TimerTestC.Union({BootIF, InitIF, TimerIF})
+channel tick
+
+
+spec_event(e) = e -> SKIP
+
+Module_TimerTestC = 
+  let
+    StateEvents = VarEvents({tickCount})
+    StateVars = Var(tickCount, 0)
+
+    Boot = (event(TimerTestC.Boot_booted, 
+                call(TimerTestC.Timer_startPeriodic)); 
+                Boot)
+    TimerFired = 
+      (event(TimerTestC.Timer_fired,
+            spec_event(tick);
+            read(tickCount, \ n @ 
+            if n+1 < MAX_TICKS
+            then assign(tickCount, n+1)
+            else post(TimerTestC_stop)));
+            TimerFired)
+            
+    StopTask = (task(TimerTestC_stop, 
+                    call(TimerTestC.Timer_stop)); 
+                    StopTask)
+                    
+    Functions = (Boot ||| TimerFired ||| StopTask)
+  within
+    (Functions [| StateEvents |] StateVars)
+  
+Configuration_TimerTestAppC = 
+    wiring(Module_TimerTestC, Configuration_TimerC, 
+           {(TimerTestC, TimerC, TimerIF)})
+       
+TimerTestApp = Application(Configuration_TimerTestAppC, {TimerTestC}, {})
+
+Ticks(0) = STOP
+Ticks(N) = tick -> Ticks(N-1)
+
+assert Ticks(1) [T= TimerTestApp \ diff(Events, {|tick|})     
+assert Ticks(10) [T= TimerTestApp \ diff(Events, {|tick|})     
+assert Ticks(11) [T= TimerTestApp \ diff(Events, {|tick|})     
+assert Ticks(12) [T= TimerTestApp \ diff(Events, {|tick|})     
+assert Ticks(20) [T= TimerTestApp \ diff(Events, {|tick|}) 
+assert Ticks(50) [T= TimerTestApp \ diff(Events, {|tick|})           
+assert Ticks(200) [T= TimerTestApp \ diff(Events, {|tick|}) 
+
+
