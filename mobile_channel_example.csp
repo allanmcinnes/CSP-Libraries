@@ -1,0 +1,110 @@
+{-
+    Testing mobile channels, and the occam-pi semantics for mobile channels[1].
+  
+    Author: Allan McInnes <allan.mcinnes@acm.org>
+    
+    [1] P.H.Welch, "A Semantics for occam-pi Mobile Channels", 
+        TUNA Project Meeting, 7-8 July, 2005.
+    
+-}
+
+-- Get the mobile channel model
+include "lib_mobile_channel.csp"
+
+-- Define the datatypes associated with the mobile channels
+datatype MobileChanField = req | buf | ret
+datatype MobileChanMessage = bufsize.{1..2} 
+                           | buffer.{1..2}
+
+-- Deadlock-free process which permits successdul termination
+DF(A) = (|~| e:A @ e -> DF(A)) |~| SKIP
+
+
+-- ==== Livelock and Deadlock ===========================================
+-- Mobile channels are livelock-free even in the worst case:
+assert Mobilize(CHAOS(MobileChanExternalChans)) :[divergence free]
+
+-- However, mobile channels *will* deadlock if "the rules of usage" 
+-- are not followed (even if the static network is deadlock-free):
+assert not DF(MobileChanExternalChans) 
+                [F= Mobilize(DF(MobileChanExternalChans))
+
+                
+-- ======================================================================
+-- Example: a mobile channel can substitute for a "normal" channel 
+
+-- A one-place buffer
+channel left, right : MobileChanMessage
+OneBuffer = 
+    let
+        Copy = left ? x -> right ! x -> Copy
+    within
+        Copy [ left <-> right ] Copy
+        
+
+-- A one-place buffer process that uses a mobile channel as its 
+-- intermediate stage
+MChanOneBuffer = 
+    let
+        Init = setMCfields ! {} -> getMC ? c -> Running(c)
+        
+        Running(c) = Sender(c) ||| Recvr(c)
+
+        Sender(c) = left ? x -> write.c ! x -> ack.c -> Sender(c)
+        Recvr(c) = read.c ? x -> right ! x -> Recvr(c)
+    within 
+        Mobilize(Init) \ MobileChanExternalChans
+        
+-- The mobile channel buffer acts just like a normal 1-place buffer
+assert OneBuffer [F= MChanOneBuffer 
+
+-- ======================================================================
+-- Example: CSP version of Fig 2 from "Prioritised Dynamic Communicating 
+-- Processes – I", (Barnes and Welch)
+
+-- Static channels used to move around mobile channel ends
+channel svrchan, clichan : MobileChanLib_ChanId
+
+Fig2_Example = 
+    let
+        -- The fields in the channel bundle
+        BufMgr = {req, buf, ret}
+                    
+        generator(s, c) = 
+            setMCfields ! BufMgr 
+            -> getMC ? bufchan 
+            -> s ! bufchan
+            -> c ! bufchan
+            -> SKIP
+            
+        client_proc(in) = 
+            in ? cv
+            -> writeb.cv.req ! bufsize.2 -> ackb.cv.req
+            -> readb.cv.buf ? b
+            -> writeb.cv.ret ! b -> ackb.cv.ret
+            -> resign.cv
+            -> SKIP
+            
+        server_proc(in) = 
+            in ? sv
+            -> readb.sv.req ? bufsize.s
+            -> writeb.sv.buf ! buffer.s -> ackb.sv.buf
+            -> readb.sv.ret ? b
+            -> resign.sv
+            -> SKIP
+            
+        StaticNetwork = 
+              (generator(svrchan, clichan)
+                 [|{|svrchan, clichan|}|]
+              (server_proc(svrchan)
+                 |||
+              client_proc(clichan)))
+    within
+        Mobilize(StaticNetwork)
+        
+A_Fig2_Example = union(MobileChanExternalChans, {|svrchan, clichan|})
+
+-- No deadlock here, because Fig2_Example follows the "rules of usage".
+assert DF(A_Fig2_Example) [F= Fig2_Example
+
+
