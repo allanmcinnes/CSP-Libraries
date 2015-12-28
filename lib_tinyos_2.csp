@@ -1,0 +1,584 @@
+{-
+
+    CSP model of TinyOS-2.x Task Scheduling and Preemption.
+    ...........................................................................
+    
+    This TinyOS model is an improved and elaborated version of the model
+    described in:
+    A. McInnes, "Using CSP to Model and Analyze TinyOS Applications", 
+    Proceedings of Engineering of Computer Based Systems 2009.
+    
+    ...........................................................................
+    
+    Allan McInnes / ECE Canterbury / 2010-02-06
+ -}
+
+ 
+
+{-
+  To use this model it's necessary to define the application-specific types
+
+nametype NesC_Function = [ union of all component interfaces ]
+
+datatype Task = [ set of all task names ]
+
+IntHandlers = [ set of all interrupt events ]
+
+-}
+
+-- We bound the nesting of atomic statements to keep the state-space limited
+-- in size. This is a necessary abstraction, but clearly the actual maximum
+-- depth of nesting may be larger than this bound for a particular model.
+-- Exceeding the bound will cause an abstraction error event, which
+-- signals that to check the model in question the bound should be increased.
+MAX_ATOMIC_DEPTH = 2
+
+-- We allow interrupts of different priorities. An executing interrupt at
+-- priority level A can be preempted by interrupts with priority levels
+-- greater than A. We use priority 255 to represent execution in a TOSH_SIGNAL
+-- context, which cannot be preempted by anything. Events representing execution
+-- in an async context are tagged with the priority level of their context
+-- in order to allow us to block execution at one level in favour of executing
+-- code from a preempting context.
+SIGNAL_PRIORITY = 255
+MAX_INTERRUPT_PRIORITY = 0
+Priorities = union({0..MAX_INTERRUPT_PRIORITY},{SIGNAL_PRIORITY})
+
+datatype IntPriority = prio.Priorities
+
+-- Set this to true in order to use non-critical blocks to reduce model-checking
+-- effort
+USE_NCB = false
+
+---- Some standard TinyOS interfaces ------------------------------------------
+datatype BootIF = Boot_booted
+datatype InitIF = Init_init
+datatype StdControlIF = StdControl_init | StdControl_start | StdControl_stop
+datatype SplitControlIF = SplitControl_start 
+                        | SplitControl_stop 
+                        | SplitControl_startDone 
+                        | SplitControl_stopDone
+
+datatype ReadIF = Read_read | Read_readDone
+
+datatype PacketIF = Packet_getPayload 
+                  | Packet_setPayloadLength
+                  | Packet_maxPayloadLength
+                  | Packet_payloadLength
+                  | Packet_clear
+
+datatype AMSendIF = AMSend_send 
+                  | AMSend_sendDone
+                  | AMSend_cancel
+                  | AMSend_maxPayloadLength
+                  | AMSend_getPayload
+                  
+datatype TimerIF = Timer_startPeriodic 
+                 | Timer_startOneShot 
+                 | Timer_stop 
+                 | Timer_fired 
+                 | Timer_isRunning 
+                 | Timer_isOneShot 
+                 | Timer_startPeriodicAt 
+                 | Timer_startOneShotAt 
+                 | Timer_getNow 
+                 | Timer_gett0 
+                 | Timer_getdt
+ 
+
+---- Types and channels -------------------------------------------------------
+-- Command and events are modeled as function calls. We split the function
+-- call into two separate events (start and end) so that a command or event
+-- that invokes another command or event blocks until the lower-level call
+-- has completed.
+-- The SyncType denotes the calling context of the function.
+-- The NesC_Function type is a set of function names defined above.
+channel exec : Exec.SyncType.NesC_Function
+channel tos_interrupt : Exec.IntPriority.IntHandler
+channel var : VarOp.NesC_Variable    -- Only callable from sync context
+channel async_var : SyncType.VarOp.NesC_Variable
+
+datatype SyncType = sync | async.IntPriority
+datatype Exec = begin | end
+datatype VarOp = getv | setv
+
+-- Tasks, like commands and events, are modeled as function calls. Tasks
+-- are posted to the scheduler via task_post.
+channel task_post : SyncType.Task
+channel task_exec : Exec.Task
+
+-- Atomic blocks and non-critical blocks are signalled to the preemption model 
+-- via these channels.
+channel atomic_blk, ncb : Exec
+
+
+---- Main model ---------------------------------------------------------------
+    
+-- The Application() process takes an application configuration, and wires
+-- it up to the rest of the TinyOS model.
+Application(AppComponentGraph, BootWiring, InitWiring) = 
+      (((AppComponentGraph
+        [|{exec.e.s.b.f | e <- Exec, b <- BootWiring, 
+                          f <- BootIF, s <- SyncType}|] 
+        FanOut(MainC, BootIF, BootWiring))
+        [|{exec.e.s.i.f | e <- Exec, i <- InitWiring, 
+                          f <- InitIF, s <- SyncType}|] 
+        FanOut(MainC_SoftwareInit, InitIF, InitWiring))
+      [|union({|task_post, task_exec|},
+              { exec.e.s.f | e <- Exec, s <- SyncType, f <- MainC_IF })|]
+      Configuration_MainC)
+      [|union({|atomic_blk, ncb, task_exec, exec, task_post, var, async_var, tos_interrupt|}, HwActions)|]
+      Preemption
+      
+
+-- The core of TinyOS is contained in the MainC component. Our simplified
+-- model of MainC includes the Boot and SoftwareInit interfaces.
+datatype MainC_IF = MainC.BootIF | MainC_SoftwareInit.InitIF
+
+-- The sched channel is an internal channel used to ensure that the 
+-- scheduler does not execute any tasks until after software init (which may 
+-- post tasks) is end.
+datatype SchedMsg = runTasks | doneTasks
+channel sched : SchedMsg
+
+-- Our model of the MainC component consists of process that models the
+-- boot sequence, and a process that models the scheduler.
+Configuration_MainC = 
+    BootProcess 
+    [|{|sched|}|] 
+    Scheduler 
+
+-- The TinyOS boot model is based on RealMainP from the standard TinyOS 2.0
+-- distribution. It triggers software initialization, allows the
+-- scheduler to process any posted tasks, then starts up the application.
+BootProcess = atomic(call(MainC_SoftwareInit.Init_init);
+                     sched.runTasks -> sched.doneTasks -> SKIP);
+              signal(MainC.Boot_booted);
+              sched.runTasks -> SKIP
+
+
+---- Scheduler ----------------------------------------------------------------
+-- The scheduler model is intended to model the behavior of the standard
+-- TinyOS FIFO scheduler. 
+--
+-- Paraphrasing from Levis, "TinyOS Programming":
+--    1. Tasks are non-preemptive: only one task runs at any time, and TinyOS 
+--       doesn’t interrupt one task to run another. 
+--    
+--    2. A task can post itself.
+--
+-- As in TinyOS 2.x, only a single occurrence of a task can appear in the queue 
+-- at any one time, and repeated posts of pending tasks have no effect. 
+-- The queue is FIFO.
+          
+channel ts_enqueue_ : Task
+Scheduler =  
+  let
+     -- Turns out this is more efficient than maintaining the queue
+     -- as a sequence in the Sch processes.
+     transparent sbisim, diamond
+     TaskQueue(N, enqueue, dequeue) = 
+       let
+         Copy(in, out) = in?x -> out!x -> Copy(in, out)
+         compress(P) = P -- sbisim(diamond(P))
+       within
+         compress([ enqueue <-> dequeue ] i:<1..N> @ Copy(enqueue, dequeue))
+     
+     -- Initially, tasks can be posted, but are not executed until
+     -- sched.runTasks occurs. This models the TinyOS boot process.
+     SchInit(Postable) = 
+        (sched.runTasks -> SchNext(Postable))
+        []
+        (task_post ? s:SyncType ? t:Postable 
+            -> ts_enqueue_ ! t -> SchInit(diff(Postable, {t})))
+        []
+        (task_post ? s:SyncType ? t':diff(Task, Postable) -> SchInit(Postable))
+        
+     -- If the queue is empty, then any task can be posted.
+     -- No tasks are executed.
+     -- The sched.doneTasks event is only allowed to occur when the queue is
+     -- empty. This ensures that any tasks posted during software init are
+     -- executed before the application is started.
+     -- A non-empty task queue results in the head task in the queue
+     -- being executed. New tasks may also be posted, if they are not
+     -- already in the queue. Note that a task becomes postable as
+     -- soon as it has started executing. This allows tasks to post
+     -- themselves.
+     SchNext(Postable) =
+        (task_exec.begin ? t -> SchExec(union(Postable, {t}), t)) 
+        []
+        (task_post ? s:SyncType ? t':Postable 
+            -> ts_enqueue_ ! t' -> SchNext(diff(Postable, {t'})))
+        []
+        (task_post ? s:SyncType ? t'':diff(Task, Postable) -> SchNext(Postable))
+        []
+        ((empty(diff(Task, Postable))) & sched.doneTasks -> SchInit(Postable))
+        
+     -- Tasks run to completion before the next task is executed
+     SchExec(Postable, t) =
+        (task_exec.end.t -> SchNext(Postable))
+        []
+        (task_post ? s:SyncType ? t':Postable 
+            -> ts_enqueue_ ! t' -> SchExec(diff(Postable, {t'}), t))
+        []
+        (task_post ? s:SyncType ? t'':diff(Task, Postable) 
+            -> SchExec(Postable, t))        
+        
+  within
+    (SchInit(Task) 
+    [| {|ts_enqueue_, task_exec.begin|} |]
+    TaskQueue(card(Task), ts_enqueue_, task_exec.begin)) \ {|ts_enqueue_|}
+    
+-- Verify run-to-completion with no task interleaving
+{-
+TestSched = task_exec.begin ? t -> task_exec.end ! t -> TestSched 
+assert TestSched [T= Scheduler \ diff(Events, {|task_exec|})
+-}
+
+---- Preemption ---------------------------------------------------------------
+
+-- The Preemption process enforces preemption of interrupts by preventing
+-- the scheduler from executing tasks, and preventing sync events from
+-- occurring, when an interrupt has happened.
+
+-- All interrupt handlers are async, and so they cannot include any sync
+-- functions in their call graph. The one and only way that an interrupt
+-- handler can execute a sync function is to post a task. A task post is an 
+-- async operation, while a task running is sync. Functions labelled async
+-- *can* be called from a sync context.
+
+-- Note that this process could be made more efficient by renaming of sync and 
+-- async actions to single events (i.e. all sync actions map to "sync"), and 
+-- synchronizing AsyncPreemption on those single events. This approach would 
+-- make the state space of AsyncPreemption much smaller.
+
+-- All actions that Preemption regulates
+-- Note that task_post is permissible in both sync and async contexts, but 
+-- posting from a sync context shouldn't be allowed during async execution.
+SyncActions = 
+    {|task_exec, task_post.sync, exec.begin.sync, exec.end.sync, var, async_var.sync|}
+
+
+-- The set of all async functions calls for a given priority level
+AsyncActions(p) = union({ exec.e.async.p.f | e <- Exec, f <- NesC_Function },
+                        {| task_post.async.p, async_var.async.p |})
+
+channel tos_sync_
+channel tos_hw_
+channel tos_async_ : IntPriority
+channel lib_tos_atomic_err
+{-
+Preemption = 
+  let     
+     -- Executing synchronous code (which can include functions labeled 
+     -- 'async') until an interrupt occurs
+     
+     SyncExec(atomicDepth, nonCB) = 
+        -- Execute any sync context functions
+        (tos_sync_ -> SyncExec(atomicDepth, nonCB))
+        []
+        -- If not atomic, execute a hardware interrupt and enter async context
+        ((atomicDepth == 0 and not nonCB) & 
+            (tos_interrupt.begin ? p:IntPriority ? i -> AsyncExec(<(p, i)>, 0)))
+        []
+        ((not nonCB) & tos_hw_ -> SyncExec(atomicDepth, nonCB))
+        []        
+        -- Handle atomic sections
+        (atomic_blk.begin -> let depth = atomicDepth+1 
+                             within 
+                                if depth > MAX_ATOMIC_DEPTH 
+                                then lib_tos_atomic_err -> STOP
+                                else SyncExec(depth, nonCB))
+        []
+        ((atomicDepth > 0) & atomic_blk.end -> SyncExec(atomicDepth-1, nonCB))
+        -- Handle non-critical blocks
+        []
+        (USE_NCB & ncb.begin -> SyncExec(atomicDepth, true))
+        []
+        (USE_NCB & ncb.end -> SyncExec(atomicDepth, false))
+        
+     -- Only execute asynchronous code until all interrupt handlers have
+     -- completed. 
+     AsyncExec(<>, atomicDepth) = 
+        SyncExec(atomicDepth, false) -- All interrupts complete
+     AsyncExec(Stack, atomicDepth) =
+        let
+            Ps = { prio.p | prio.p <- IntPriority, p > priority}
+            (prio.priority, intr) = head(Stack)
+        within
+            (tos_async_.prio.priority -> AsyncExec(Stack, atomicDepth)) 
+            []
+            (tos_hw_ -> AsyncExec(Stack, atomicDepth))
+            []
+            (tos_interrupt.end.prio.priority.intr -> 
+                AsyncExec(tail(Stack), atomicDepth))
+            []
+            -- If not atomic, execute a hardware interrupt and add to set of
+            -- active interrupts.
+            ((atomicDepth == 0) & 
+                (tos_interrupt.begin ? p:Ps ? i ->
+                    AsyncExec(<(p, i)>^Stack, 0)))    
+            []
+            -- Handle atomic sections
+            (atomic_blk.begin -> let depth = atomicDepth+1 
+                                 within 
+                                    if depth > MAX_ATOMIC_DEPTH 
+                                    then lib_tos_atomic_err -> STOP
+                                    else AsyncExec(Stack, depth))
+            []
+            ((atomicDepth > 0) & atomic_blk.end -> 
+                AsyncExec(Stack, atomicDepth-1))  
+          
+  within
+    (SyncExec(0, false))[[ tos_sync_ <- s, tos_async_.p <- as , tos_hw_ <- hw
+                                 | s <- SyncActions,
+                                   p <- IntPriority,
+                                   as <- AsyncActions(p),
+                                   hw <- HwActions ]]
+-}
+Preemption = 
+  let     
+     -- Executing synchronous code (which can include functions labeled 
+     -- 'async') until an interrupt occurs
+     
+     SyncExec(atomicDepth, nonCB) = 
+        -- Execute any sync context functions
+        ([] s:SyncActions @ s -> SyncExec(atomicDepth, nonCB))
+        []
+        -- If not atomic, execute a hardware interrupt and enter async context
+        ((atomicDepth == 0 and not nonCB) & 
+            (tos_interrupt.begin ? p:IntPriority ? i -> AsyncExec(<(p, i)>, 0)))
+        []
+        ((not nonCB) & [] hw:HwActions @ hw -> SyncExec(atomicDepth, nonCB))
+        []        
+        -- Handle atomic sections
+        (atomic_blk.begin -> let depth = atomicDepth+1 
+                             within 
+                                if depth > MAX_ATOMIC_DEPTH 
+                                then lib_tos_atomic_err -> STOP
+                                else SyncExec(depth, nonCB))
+        []
+        ((atomicDepth > 0) & atomic_blk.end -> SyncExec(atomicDepth-1, nonCB))
+        -- Handle non-critical blocks
+        []
+        (USE_NCB & ncb.begin -> SyncExec(atomicDepth, true))
+        []
+        (USE_NCB & ncb.end -> SyncExec(atomicDepth, false))
+        
+     -- Only execute asynchronous code until all interrupt handlers have
+     -- completed. 
+     AsyncExec(<>, atomicDepth) = 
+        SyncExec(atomicDepth, false) -- All interrupts complete
+     AsyncExec(Stack, atomicDepth) =
+        let
+            Ps = { prio.p | prio.p <- IntPriority, p > priority}
+            (prio.priority, intr) = head(Stack)
+        within
+            ([] a:AsyncActions(prio.priority) @ a -> AsyncExec(Stack, atomicDepth)) 
+            []
+            ([] hw:HwActions @ hw -> AsyncExec(Stack, atomicDepth))
+            []
+            (tos_interrupt.end.prio.priority.intr -> 
+                AsyncExec(tail(Stack), atomicDepth))
+            []
+            -- If not atomic, execute a hardware interrupt and add to set of
+            -- active interrupts.
+            ((atomicDepth == 0) & 
+                (tos_interrupt.begin ? p:Ps ? i ->
+                    AsyncExec(<(p, i)>^Stack, 0)))    
+            []
+            -- Handle atomic sections
+            (atomic_blk.begin -> let depth = atomicDepth+1 
+                                 within 
+                                    if depth > MAX_ATOMIC_DEPTH 
+                                    then lib_tos_atomic_err -> STOP
+                                    else AsyncExec(Stack, depth))
+            []
+            ((atomicDepth > 0) & atomic_blk.end -> 
+                AsyncExec(Stack, atomicDepth-1))  
+          
+  within
+    SyncExec(0, false)
+
+---- Syntactic sugar ----------------------------------------------------------
+    
+-- Convenience functions that capture event patterns for function definition
+-- and invocation.
+
+-- Sync functions can only be executed from a sync context. Function invocation
+-- causes the function Body to be executed.
+FnDef(f, Body) = exec.begin.sync.f -> Body; exec.end.sync.f -> SKIP
+
+FnDefArgs(f, Body) = 
+    exec.begin.sync.f ? arg -> (Body(arg); exec.end.sync.f.arg -> SKIP)
+
+-- Async functions can be called from both sync and async contexts. The variable
+-- 's' stores the calling context. 
+AsyncFnDef(f, Body) = 
+    [] s:SyncType @ exec.begin.s.f -> Body(s); exec.end.s.f -> SKIP
+
+AsyncFnDefArgs(f, Body) = 
+    [] s:SyncType @ exec.begin.s.f ? arg -> 
+        (Body(s)(arg); exec.end.s.f.arg -> SKIP)
+
+-- Function execution is triggered using the exec.begin event. The variable 's'
+-- indicates the calling context.
+FnExec(s)(f) = exec.begin.s.f -> exec.end.s.f -> SKIP
+
+-- Syntactic sugar for nesC constructions
+-- Sync code
+command(f, Body) = FnDef(f, Body)
+command_args(f, Body) = FnDefArgs(f, Body)
+event(f, Body) = FnDef(f, Body)
+event_args(f, Body) = FnDefArgs(f, Body)
+call(f) = FnExec(sync)(f)
+signal(f) = FnExec(sync)(f)
+
+-- Async code
+async_command(f, Body) = AsyncFnDef(f, Body)
+async_command_args(f, Body) = AsyncFnDefArgs(f, Body)
+async_event(f, Body) = AsyncFnDef(f, Body)
+async_event_args(f, Body) = AsyncFnDefArgs(f, Body)
+async_call(s)(f) = FnExec(s)(f)
+async_signal(s)(f) = FnExec(s)(f)
+
+-- Interrupt handlers
+TOSH_SIGNAL(f, Body) = 
+    TOSH_INTERRUPT(f, prio.SIGNAL_PRIORITY, Body)
+    
+TOSH_INTERRUPT(f, priority, Body) = 
+    tos_interrupt.begin.priority.f -> Body(async.priority);
+        tos_interrupt.end.priority.f -> SKIP
+    
+TOSH_SIGNAL_input(f, Body) = 
+    TOSH_INTERRUPT_input(f, prio.SIGNAL_PRIORITY, Body)
+    
+TOSH_INTERRUPT_input(f, priority, Body) = 
+    tos_interrupt.begin.priority.f ? x -> 
+        (Body(async.priority)(x); tos_interrupt.end.priority.f.x -> SKIP)
+
+-- Task definition and execution
+task(f, Body) = 
+    task_exec.begin.f -> 
+    (if USE_NCB 
+    then ncb.begin -> Body; ncb.end -> SKIP 
+    else Body);
+    task_exec.end.f -> SKIP
+    
+post(t) = 
+    if USE_NCB then ncb.end -> task_post.sync.t -> ncb.begin -> SKIP
+    else task_post.sync.t -> SKIP
+async_post(s)(t) = task_post.s.t -> SKIP
+    
+-- Atomic blocks
+atomic(Block) = atomic_blk.begin -> Block; atomic_blk.end -> SKIP
+
+-- Wiring of component A to component B. The wiring connections are specified
+-- as a set of 3-tuples, consisting of an interface from A, and interface from
+-- B, and a set of function names upon which the components will synchronize.
+-- For example, to wire the RadioSenseC_MilliTimer of component A to the TimerC 
+-- interface of component B, and synchronize on the functions in TimerIF, the 
+-- Connections set should include the 3-tuple (RadioSenseC_MilliTimer, TimerC, 
+-- TimerIF).
+-- Wiring is done by renaming all relevant events from component B to the 
+-- corresponding events in component A, and then synchronizing the two
+-- processes on the shared events.
+-- We use renaming instead of parameterizing on channels because renaming
+-- makes it easier to treat composite processes as single components without
+-- having to define lengthy parameter lists, and also because renaming
+-- makes handling of fan-in easier (see below).
+wiring(A, B, Connections) = 
+    (A 
+     [|{exec.e.s.IF_A.f | e <-  Exec, 
+                          (IF_A, _, Fns) <- Connections, 
+                          f <- Fns,
+                          s <- SyncType}|] 
+     (B[[ exec.e.s.IF_B.f <- exec.e.s.IF_A.f
+          | e <-  Exec, 
+            (IF_A, IF_B, Fns) <- Connections,
+            f <- Fns,
+            s <- SyncType ]]))
+            
+-- Pass-through wiring simply renames the interface of one component to that of
+-- another component. Example (from FTSP):
+--   components new TimeSyncP(TMilli);
+--
+--   GlobalTime      =   TimeSyncP;
+--   StdControl      =   TimeSyncP;
+--   Init            =   TimeSyncP;
+--   Boot            =   TimeSyncP;
+
+passthru(Component, IFA, IFB, Interfaces) = 
+  (Component [[ exec.e.s.IFA.m <- exec.e.s.IFB.m
+            | e <-  Exec, s <- SyncType, m <- Union(Interfaces) ]])            
+
+-- To allow for fan-in, we rename as above but also rename the events from
+-- component B to themselves, so that they are still available for 
+-- synchronization with other components.
+wiring_with_fanin(A, B, Connections) = 
+    (A 
+     [|{exec.e.s.IF_A.f | e <-  Exec, 
+                               (IF_A, _, IFtype) <- Connections, 
+                               f <- IFtype,
+                               s <- SyncType}|] 
+     (B[[ exec.e.s.IF_B.f <- exec.e.s.IF_A.f,
+          exec.e.s.IF_B.f <- exec.e.s.IF_B.f  -- Preserve fan-in
+          | e <-  Exec, 
+            (IF_A, IF_B, IFtype) <- Connections,
+            f <- IFtype,
+            s <- SyncType ]]))
+
+-- Fan-in can be easily modelled by direct synchronization, so long as the 
+-- processes that are fanning in do not synchronize with each other
+
+-- Fan-out requires the insertion of an intermediate process to enforce the
+-- sequentiality of invocation for the fanned-out componenets. Direct 
+-- synchronization would cause all of the components to begin executing
+-- concurrently, which is not reflective of the nesC fanout execution 
+-- semantics. We model fan-out using nondeterministic choice, since we want
+-- to enforce sequentiality without imposing a particular call-list order.
+
+FanOut(comp, Fns, OutComps) = 
+  let
+    AwaitOut = exec.begin ? s:SyncType ! comp ? f:Fns -> ExecOut(s, f, OutComps)
+    
+    ExecOut(s, f, {}) = exec.end.s.comp.f -> AwaitOut -- Complete
+    ExecOut(s, f, Comps) = |~| c:Comps @ exec.begin.s.c.f 
+                                -> exec.end.s.c.f 
+                                -> ExecOut(s, f, diff(Comps, {c}))
+  within
+    AwaitOut
+    
+-- Variables are helpful for storing component state when that state is complex
+channel lib_tos_datarace_err
+
+Var(name, val) = 
+    (var.getv.name ! val -> Var(name, val))
+    []
+    (var.setv.name ? val' -> Var(name, val'))
+    []
+    (async_var ? _:SyncType ? _:VarOp ! name ? _ -> 
+        lib_tos_datarace_err -> STOP)
+
+AsyncVar(name, val) = 
+    (async_var ? s:SyncType ! getv ! name ! val -> AsyncVar(name, val))
+    []
+    (async_var ? s:SyncType ! setv ! name ? val' -> AsyncVar(name, val'))
+    []
+    (var ? _:VarOp ! name ? _ -> lib_tos_datarace_err -> STOP)
+    
+VarEvents(names) = 
+  union({ var.op.x | op <- VarOp, n <- names, x <- {|n|}},  
+        { async_var.s.op.x | s <- SyncType, op <- VarOp, n <- names, x <- {|n|}})
+    
+assign(name, val) = var.setv.name ! val -> SKIP
+read(name, P) = var.getv.name ? v -> P(v) 
+async_assign(s)(name, val) = 
+    if USE_NCB and s == sync
+    then ncb.end -> async_var.s.setv.name ! val -> ncb.begin -> SKIP
+    else async_var.s.setv.name ! val -> SKIP
+async_read(s)(name, P) =
+    if USE_NCB and s == sync
+    then ncb.end -> async_var.s.getv.name ? v -> ncb.begin -> P(v)
+    else async_var.s.getv.name ? v -> P(v)
+
