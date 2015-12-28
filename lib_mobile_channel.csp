@@ -1,0 +1,319 @@
+{-
+    ==== Mobile Channel Library ==============================================
+    
+    A generic implementation of Peter Welch's ideas for modeling mobile 
+    channels (as used in occam-pi and JCSP) in CSP[1]. This library can be 
+    included into any CSP script that requires mobile channels. 
+    
+    In order to use this library you must define two types:
+        MobileChanField - the set of all possible fieldnames that may appear 
+                          in a channel bundle
+                          
+        MobileChanMessage - the set of all possible messages that might be 
+                            passed through any mobile channel in the system
+    
+   [1] P.H.Welch, "A Semantics for occam-pi Mobile Channels", 
+       TUNA Project Meeting, 7-8 July, 2005.
+       
+       
+       
+    ---- Usage ---------------------------------------------------------------
+    
+    A network that uses mobile channels can be constructed by first creating
+    a standard statically connected network of CSP processes, and then applying
+    the 'Mobilize' function, e.g.
+    
+        ...
+        StaticNetwork = P1 [| A |] P2
+        MobileNetwork = Mobilize(StaticNetwork)
+        ...
+
+    This procedure wraps the static network in a mobile channel infrastructure
+    that provides the processes within the static network with the capability
+    to dynamically create mobile channels and channel bundles, and to send and
+    receive messages via these mobile channels. See also the examples in the 
+    accompanying CSP script "test_mobile_channels.csp".
+    
+    
+    Initializing a channel
+    ----------------------
+    
+    To create a new channel a process must perform the following 
+    sequence of communciations:
+    
+        ... -> setMCfields!f -> getMC?c -> ...
+        
+    This creates a mobile channel bundle composed of the fields specified in
+    the set 'f'. If 'f' is the empty set, an individual mobile channel (rather
+    than a bundle) is created. The identifier for the newly created mobile
+    channel is returned in 'c'. This identifier can be passed to other 
+    processes in order to establish a mobile link with them. 
+    
+    Things to note:
+    
+    (1) Although there is only one channel id, the channel is assumed to
+        consist of two "ends" and thus the initiating process is considered to
+        hold two references to the new channel.
+        
+    (2) In the interests of keeping the state space finite, the number of 
+        channels that can be created is limited. Once this limit is reached,
+        all further attempts to create a mobile channel will result in 
+        deadlock.
+    
+    
+    Reading and Writing on channels
+    -------------------------------
+    
+    To send message 'm' via a mobile channel 'c' (note the ack - this preserves
+    the atomicity of the channel communication):
+    
+        ... -> write.c ! m -> ack.c -> ...
+        
+    To receive a message via channel 'c':
+    
+        ... -> read.c ? m -> ...
+        
+    If the channel is a bundle, to read or write from field 'f1':
+    
+        ... -> writeb.c.f1 ! m -> ackb.c.f1 -> ...    
+        ... -> readb.c.f1 ? m -> ...
+
+    Note that any process which holds the appropriate channel id can read or
+    write on the corresponding channel. Thus all channels are implicitly shared.
+    We assume that the actual implementation (occam or JCSP) enforces 
+    single-reader/single-writer semantics on unshared channels.
+    
+    
+    Simulating Shared channels
+    --------------------------
+    
+    The occam-pi style of shared channels can be simulated through the use of 
+    'claim' and 'release' events on a particular end ("client" or "server") of
+    the channel, e.g.
+    
+        ... -> claim.c.MobileChanLib_server 
+                    -> read.c ? x -> release.c.MobileChanLib_server -> ...
+
+    The semantics of claim/release are essentially those of a semaphore which
+    provides an exclusive lock on one end of the shared channel. 
+    
+    When sending a shared channel end to another process the sending process
+    should 'enroll' in the shared channel. This increments the reference count
+    on the channel, reflecting the fact that the sending process retains a
+    reference to the channel:
+    
+        ... -> enroll.c -> out ! c -> ...
+    
+    
+    Channel termination
+    -------------------
+    
+    Once a process is done with a channel end (either shared or unshared),
+    it should 'resign' from the channel:
+    
+        ... -> resign.c -> ...
+        
+    This decrements the reference count on the channel (initially set to 2). A
+    channel with 0 references will terminate.
+    
+    --------------------------------------------------------------------------
+    
+    Author: Allan McInnes <allan.mcinnes@acm.org>
+    
+-}
+
+
+{-
+    ++++ Configuration information - feel free to edit as necessary ++++
+    
+    Note that increasing these constants can result in drastic increases
+    in the state space within FDR. It is a good idea to use the minimum number
+    of mobile channels that are necessary.
+-}
+-- Maximum number of mobile channels that can exist at any one time
+MobileChanLib_MaxChans = 2
+
+-- Maximum number of references that can be made to an individual channel
+MobileChanLib_MaxRefsPerChan = 4
+
+
+-- ++++ The external interface with other CSP scripts ++++
+
+-- Constants:
+MobileChanLib_server = 0
+MobileChanLib_client = 1
+MobileChanLib_undefined = 0
+nametype MobileChanLib_ChanId = {0..MobileChanLib_MaxChans}
+nametype MobileChanLib_ChanEnd = {MobileChanLib_server, MobileChanLib_client}
+
+-- Channel definitions:
+-- Create a new mobile channel
+channel setMCfields : Set(MobileChanField)
+channel getMC : MobileChanLib_ChanId
+-- Add or remove a reference to a channel
+channel enroll, resign : MobileChanLib_ChanId
+-- Read or write an individual channel
+channel write, read : MobileChanLib_ChanId.MobileChanMessage
+channel ack : MobileChanLib_ChanId
+-- Read or write a member of a channel bundle
+channel writeb, readb : MobileChanLib_ChanId.MobileChanField.MobileChanMessage
+channel ackb : MobileChanLib_ChanId.MobileChanField
+-- Claim or release shared channels ends
+channel claim, release : MobileChanLib_ChanId.MobileChanLib_ChanEnd
+
+MobileChanExternalChans =
+    {|
+        read, write, ack,        
+        readb, writeb, ackb,
+        enroll, resign,
+        claim, release,
+        setMCfields, getMC
+    |}
+    
+-- ++++ Library Internals +++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+{-
+    Define a namespace for internal events, to prevent naming conflicts
+    with other CSP scripts.
+-}
+datatype MobileChanLibMessage
+    = kill          -- terminate a single channel
+    | noMoreBundles -- terminate the entire mobile channel system
+                               
+channel MobileChanLib : MobileChanLibMessage
+
+MobileChanInternalChans = {|MobileChanLib|}
+    
+MobileChanKernelChans = union(MobileChanExternalChans, MobileChanInternalChans)
+
+{-
+    Mobilize(Sys)
+    
+    The primary function in this library.
+    This function takes a user defined static process network, and wraps
+    the mobile channel infrastructure around it. An example usage is:
+        ...
+        StaticNetwork = P1 [| A |] P2
+        MobileNetwork = Mobilize(StaticNetwork)
+        ...
+        
+    Note that all of the processes related to creating the mobile channels
+    have been enclosed in a let-within block in order to prevent naming
+    conflicts with other scripts.
+-}
+Mobilize(Sys) = 
+let
+    {-
+        A channel bundle is a parallel collection of processes: one holding a 
+        reference count, two semaphores (one for each possibly shared end) and
+        one channel process for each field in the bundle. 'c' is an index,
+        unique for each mobile channel bundle, and 'f' is a set of the field
+        names in the bundle
+    -}
+    
+    Bundle(c,f) =
+        (((Refs(c, 2) 
+            [|{MobileChanLib.kill}|]
+        Sem(c, MobileChanLib_server))
+            [|{MobileChanLib.kill}|]
+        Sem(c, MobileChanLib_client))
+            [|{MobileChanLib.kill}|]
+        Channels(c, f)) \ {MobileChanLib.kill}
+
+    {-
+        The reference counter keeps track of how many processes hold a reference
+        to the mobile channel. Channels that reach a reference count of 0
+        terminate. In the interests of finite state, the maximum number of
+        references is restricted.
+    -}
+    Refs(c, 0) = MobileChanLib.kill -> SKIP
+    Refs(c, n) =
+        (n < MobileChanLib_MaxRefsPerChan) & enroll.c -> Refs (c, n + 1) 
+        [] resign.c -> Refs (c, n - 1)                                
+
+    -- The semaphore is 
+    Sem(c, x) =
+        claim.c.x -> release.c.x -> Sem (c, x) 
+        [] MobileChanLib.kill -> SKIP
+
+    -- The channels in a bundle
+    -- If there are no fields we build an individual channel...
+    Channels(c, {}) = Chan(c)
+    -- ... otherwise construct group of channels, one for each field
+    Channels(c, f) = [|{MobileChanLib.kill}|] field:f @ ChanB(c, field)
+
+    -- Individual channel (not part of a bundle)
+    Chan(c) =
+        write.c ? p -> read.c ! p -> ack.c -> Chan(c) 
+        [] MobileChanLib.kill -> SKIP
+        
+    -- Member of a bundle
+    ChanB(c, f) =
+        writeb.c.f ? p -> readb.c.f ! p -> ackb.c.f -> ChanB(c, f) 
+        [] MobileChanLib.kill -> SKIP
+        
+    {- 
+        Mobile channels and channel bundles are generated by a channel server.
+        
+        Note that, at present, a channel id can only be used ONCE. This is
+        somewhat limiting, but does help to reduce the state space. 
+        
+        An alternative implementation would be to maintain a set of unassigned
+        channel id numbers (rather than a count), and to nondeterministically
+        choose a number from this set when a new channel is created. Active
+        channels would signal the server upon termination, allowing the server
+        to place the freed channel id back into the pool of unassigned ids. 
+        However, this may produce a drastic explosion in the number of states.
+    -}
+    MobileChannelServer(c) =
+        (c <= MobileChanLib_MaxChans) & 
+            setMCfields ? f -> getMC ! c 
+                -> (Bundle (c, f) ||| MobileChannelServer(c + 1)) 
+        [] MobileChanLib.noMoreBundles -> SKIP
+        
+    {- 
+        Application processes may sometimes try to resign from undefined
+        bundle-end variables.  For convenience, mobile channel bundles have
+        indices greater than zero and we define:
+    -}
+    UndefinedBundle =
+        resign.MobileChanLib_undefined -> UndefinedBundle 
+        [] MobileChanLib.noMoreBundles -> SKIP
+    
+    {-
+       We apply an atomicity constraint in order to force each communication
+       event to appear completely atomic to an outside observer. This has two
+       beneficial effects: 
+          1. It makes the semantics of mobile channel commmunications more
+             like those of standard CSP channel communications, in which
+             communication events are strictly atomic.
+          2. It helps to reduce the state-space of the mobile channel kernel,
+             by eliminating the possibility of channel communications on
+             different mobile channels being interleaved.
+    -}
+    A_AtomicityConstraint = 
+        {|
+            write, ack, 
+            writeb, ackb, 
+            MobileChanLib.noMoreBundles
+        |}
+        
+    AtomicityConstraint = 
+        write ? c ? _ -> ack.c -> AtomicityConstraint
+        [] writeb ? c ? f ? _ -> ackb.c.f -> AtomicityConstraint 
+        [] MobileChanLib.noMoreBundles -> SKIP
+
+        
+    -- The complete mobile channel kernel
+    MobileChannelKernel = 
+        (MobileChannelServer(1) 
+            [|{MobileChanLib.noMoreBundles}|] 
+        UndefinedBundle)
+            [| A_AtomicityConstraint |]
+        AtomicityConstraint
+        
+within ((Sys; MobileChanLib.noMoreBundles -> SKIP) 
+            [| MobileChanKernelChans |] 
+        MobileChannelKernel) \ MobileChanInternalChans
+
+
